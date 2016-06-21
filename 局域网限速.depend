@@ -1,0 +1,12 @@
+# depslib dependency file v1.0
+1466520537 source:f:\cÓïÑÔ\¾ÖÓòÍøÏŞËÙ\main.c
+	<stdio.h>
+	<stdlib.h>
+	<string.h>
+	<windows.h>
+	<pcap.h>
+	<conio.h>
+	<winsock2.h>
+	<iphlpapi.h>
+	<time.h>
+
