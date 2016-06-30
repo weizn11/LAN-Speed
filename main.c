@@ -28,13 +28,17 @@ const char *about_str=\
 const char *config_format=\
                           "[系统配置]\n"
                           "限速模式=1\t\t#1.白名单  2.黑名单\n"
-                          "发包间隔=1000\t\t#单位：ms\n"
-                          "限制总速率=100\t\t#单位：Kb/s\n"
+                          "场景模式=1\t\t#1.正常    2.广播域隔离\n"
+                          "应答模式=1\t\t#1.主动    2.被动\n"
+                          "发包间隔=3000\t\t#单位：ms\n"
+                          "限制总速率=50\t\t#单位：Kb/s\n"
                           "[主机列表]\n";
 
 typedef struct _System_Config_
 {
     int confineMode;   //限速模式
+    int sceneMode;     //场景模式
+    int respondMode;   //应答模式
     int interval;      //发包间隔
     int totalSpeed;    //总速率
 
@@ -42,6 +46,7 @@ typedef struct _System_Config_
     unsigned char myMAC[6];
     char gatewayIp[16];
     unsigned char gatewayMAC[6];
+    char mask[16];
 
     pcap_t *hpcap;
 } SYS_CON;
@@ -60,6 +65,8 @@ HOST_INFO *glp_custom_List_Header=NULL;
 CRITICAL_SECTION cs_flowSpeed;
 unsigned long int arpPacketCount=0;
 unsigned long int flowPacketCount=0;
+unsigned long int subHostCount=0;
+unsigned long int macScanCount=0;
 double flowSpeed=0;
 double recordFlowSpeed=0;
 double totalFlowSize=0;
@@ -231,6 +238,7 @@ BOOL ChooseDev(char *devbuff,int buffsize,char *ipbuff)
         {
             strcat(devbuff,d->name);
             strcat(ipbuff,iptos(((struct sockaddr_in *)a->addr)->sin_addr.s_addr));
+            strcat(gl_Sys_Con.mask,iptos(((struct sockaddr_in *)a->netmask)->sin_addr.s_addr));
         }
     }
     pcap_freealldevs(alldevs);
@@ -340,6 +348,11 @@ int bind_arp_list()
     return 0;
 }
 
+DWORD WINAPI respond_arp_thread(LPVOID para)
+{
+    return 0;
+}
+
 int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt_data)
 {
     char *Packet=NULL;
@@ -350,8 +363,9 @@ int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt
     HOST_INFO *pNode=NULL;
 
     Packet=pkt_data;
-    DLCHeader=(DLCHEADER *)Packet;
 
+    if(pkthdr->caplen<sizeof(DLCHEADER)) return -1;
+    DLCHeader=(DLCHEADER *)Packet;
     if(strncmp(DLCHeader->DesMAC,gl_Sys_Con.myMAC,6)) return 0;
 
     //printf("%d %d\n",pkthdr->caplen,pkthdr->len);
@@ -359,6 +373,7 @@ int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt
     if(ntohs(DLCHeader->EtherType)==0x0806)
     {
         //接收到ARP协议包
+        if(pkthdr->caplen<sizeof(DLCHEADER)+sizeof(ARPFRAME)) return -1;
         ARPHeader=(ARPFRAME *)(Packet+sizeof(DLCHEADER));
         if(ARPHeader->Opcode==htons(2))
         {
@@ -386,10 +401,15 @@ int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt
                 }
             }
         }
+        else
+        {
+            //接收到ARP请求包
+        }
     }
     else if(ntohs(DLCHeader->EtherType)==0x0800)
     {
         //接收到IP数据包
+        if(pkthdr->caplen<sizeof(DLCHEADER)+sizeof(IP)) return -1;
         IPHeader=(IP *)(Packet+sizeof(DLCHEADER));
         memset(tmpIp,NULL,sizeof(tmpIp));
         strcat(tmpIp,inet_ntoa(*(struct in_addr *)IPHeader->ip_dst));
@@ -558,6 +578,22 @@ int init_config()
                 *p2=NULL;
                 gl_Sys_Con.confineMode=atoi(p1);
             }
+            else if(!strncmp("场景模式",readBuf,p1-readBuf))
+            {
+                p1++;
+                p2=strchr(p1,'\t');
+                if(p2==NULL || p1==p2) return -1;
+                *p2=NULL;
+                gl_Sys_Con.sceneMode=atoi(p1);
+            }
+            else if(!strncmp("应答模式",readBuf,p1-readBuf))
+            {
+                p1++;
+                p2=strchr(p1,'\t');
+                if(p2==NULL || p1==p2) return -1;
+                *p2=NULL;
+                gl_Sys_Con.respondMode=atoi(p1);
+            }
             else if(!strncmp("发包间隔",readBuf,p1-readBuf))
             {
                 p1++;
@@ -601,61 +637,101 @@ int init_config()
     return 0;
 }
 
+/*测试主网和子网是否匹配，也可测试两个主机IP是否在同一网段内*/
+int netIPAndSubnetValid(char *strIp,char *strSubip,char *strMask)
+{
+    int addr1,addr2;
+    unsigned int IP,subIP,mask;
+
+    IP=inet_addr(strIp);
+    subIP=inet_addr(strSubip);
+    mask=inet_addr(strMask);
+
+    addr1=IP & mask;
+    addr2=subIP & mask;
+
+    if(addr1!=addr2)
+        return 0;
+
+    return 1;
+}
+
 int init_host_list()
 {
-    char ip[16];
+    char ipPrefix[16],ip[16];
     char *p=NULL;
-    int i=1;
+    int i,j,writeList=0;
+    int tmpIndex[4];
     HOST_INFO *pNode=NULL,*pNode2=NULL;
 
-    memset(ip,NULL,sizeof(ip));
+    memset(ipPrefix,NULL,sizeof(ipPrefix));
+
+    strcat(ipPrefix,gl_Sys_Con.myIPAddress);
+    p=strrchr(ipPrefix,'.');
+    if(p==NULL) return -1;
+    *p=NULL;
+    p=strrchr(ipPrefix,'.');
+    *p=NULL;
 
     if(gl_Sys_Con.confineMode==1)
     {
-        glp_Host_List_Header=(HOST_INFO *)malloc(sizeof(HOST_INFO));
-        if(glp_Host_List_Header==NULL) return -1;
-        memset(glp_Host_List_Header,NULL,sizeof(HOST_INFO));
-
-        strcat(ip,gl_Sys_Con.myIPAddress);
-        p=strrchr(ip,'.');
-        if(p==NULL) return -1;
-        p++;
-        memset(p,NULL,16-(p-ip));
-
-        sprintf(glp_Host_List_Header->ip,"%s%d",ip,i);
-
-        for(i=2,pNode=glp_Host_List_Header; i<=254; i++)
-        {
-            pNode->next=(HOST_INFO *)malloc(sizeof(HOST_INFO));
-            if(pNode->next==NULL) return -1;
-            memset(pNode->next,NULL,sizeof(HOST_INFO));
-
-            sprintf(pNode->next->ip,"%s%d",ip,i);
-            //检测是不是网关或本机IP
-            while(!strcmp(pNode->next->ip,gl_Sys_Con.gatewayIp) || !strcmp(pNode->next->ip,gl_Sys_Con.myIPAddress))
+        //白名单模式
+        for(tmpIndex[2]=0; tmpIndex[2]<=255; tmpIndex[2]++)
+            for(tmpIndex[3]=1; tmpIndex[3]<255; tmpIndex[3]++)
             {
-                i++;
-                if(i>254) return 0;
-                memset(pNode->next,NULL,sizeof(HOST_INFO));
-                sprintf(pNode->next->ip,"%s%d",ip,i);
-            }
-            //检测是不是白名单IP
-            for(pNode2=glp_custom_List_Header; pNode2!=NULL; )
-            {
-                if(!strcmp(pNode->next->ip,pNode2->ip))
+                memset(ip,NULL,sizeof(ip));
+
+                //生成新IP地址
+                sprintf(ip,"%s.%d.%d",ipPrefix,tmpIndex[2],tmpIndex[3]);
+
+                //是否和本机处于同一子网
+                if(!netIPAndSubnetValid(ip,gl_Sys_Con.myIPAddress,gl_Sys_Con.mask))
                 {
-                    i++;
-                    if(i>254) return 0;
-                    memset(pNode->next,NULL,sizeof(HOST_INFO));
-                    sprintf(pNode->next->ip,"%s%d",ip,i);
-                    pNode2=glp_custom_List_Header;
                     continue;
                 }
-                pNode2=pNode2->next;
+
+                //检测是不是网关或本机IP
+                if(!strcmp(ip,gl_Sys_Con.gatewayIp) || !strcmp(ip,gl_Sys_Con.myIPAddress))
+                {
+                    continue;
+                }
+
+                //检测是不是白名单IP
+                for(pNode2=glp_custom_List_Header,writeList=0; pNode2!=NULL; pNode2=pNode2->next)
+                {
+                    if(!strcmp(ip,pNode2->ip))
+                    {
+                        writeList=1;
+                        break;
+                    }
+                    else
+                    {
+                        writeList=0;
+                    }
+                }
+                if(writeList) continue;
+
+                //加入到探测列表中
+                subHostCount++;
+                if(glp_Host_List_Header==NULL)
+                {
+                    glp_Host_List_Header=(HOST_INFO *)malloc(sizeof(HOST_INFO));
+                    if(glp_Host_List_Header==NULL) return -1;
+
+                    pNode=glp_Host_List_Header;
+                }
+                else
+                {
+                    for(pNode=glp_Host_List_Header; pNode->next!=NULL; pNode=pNode->next);
+                    pNode->next=(HOST_INFO *)malloc(sizeof(HOST_INFO));
+                    if(pNode->next==NULL) return -1;
+
+                    pNode=pNode->next;
+                }
+                memset(pNode,NULL,sizeof(HOST_INFO));
+                strcat(pNode->ip,ip);
             }
-            //加入到探测列表中
-            pNode=pNode->next;
-        }
+
     }
     else
     {
@@ -672,6 +748,11 @@ DWORD WINAPI scan_host_mac_thread(LPVOID para)
 
     while(1)
     {
+        //询问网关MAC
+        memset(ARPPacket,NULL,sizeof(ARPPacket));
+        Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),NULL,gl_Sys_Con.gatewayIp,gl_Sys_Con.myMAC,gl_Sys_Con.myIPAddress,1);
+        SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
+
         //扫描目标主机MAC
         for(pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
         {
@@ -687,11 +768,9 @@ DWORD WINAPI scan_host_mac_thread(LPVOID para)
             memset(ARPPacket,NULL,sizeof(ARPPacket));
             Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),NULL,pNode->ip,gl_Sys_Con.myMAC,gl_Sys_Con.myIPAddress,1);
             SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
+            Sleep(2);
         }
-        //询问网关MAC
-        memset(ARPPacket,NULL,sizeof(ARPPacket));
-        Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),NULL,gl_Sys_Con.gatewayIp,gl_Sys_Con.myMAC,gl_Sys_Con.myIPAddress,1);
-        SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
+        macScanCount++;
         Sleep(5000);
     }
 
@@ -740,6 +819,7 @@ DWORD WINAPI arp_spoof_thread(LPVOID para)
                                    gl_Sys_Con.myMAC,pNode->ip,2);
                     SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
                     arpPacketCount++;
+                    Sleep(2);
                 }
             }
         }
@@ -751,25 +831,26 @@ DWORD WINAPI arp_spoof_thread(LPVOID para)
 
 DWORD WINAPI print_log_thread(LPVOID para)
 {
-    int i;
+    int i,n;
     HOST_INFO *pNode=NULL;
 
     while(1)
     {
-        for(i=0,pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
+        for(i=n=0,pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
         {
             if(!memory_empty(pNode->mac,6))
             {
                 i++;
             }
+            //n++;
         }
         if(print_lock) return 0;
         system("cls");
         printf("%s\n",about_str);
         printf("本机IP：%s\n",gl_Sys_Con.myIPAddress);
         printf("网关IP：%s\n\n",gl_Sys_Con.gatewayIp);
-        printf("限速主机:\t%d\t个\n发送ARP包:\t%d\t个\n转发流量包:\t%d\t个\n转发流量速率:\t%.2f\tKb/s\n总转发流量:\t%.2f\tMb\n",\
-               i,arpPacketCount,flowPacketCount,recordFlowSpeed/1024,totalFlowSize/1024/1024);
+        printf("子网主机：\t%d\t个\n限速主机:\t%d\t个\n探测计数：\t%d\t次\n发送ARP包:\t%d\t个\n转发流量包:\t%d\t个\n转发流量速率:\t%.2f\tKb/s\n总转发流量:\t%.2f\tMb\n",\
+               subHostCount,i,macScanCount,arpPacketCount,flowPacketCount,recordFlowSpeed/1024,totalFlowSize/1024/1024);
         Sleep(1000);
     }
 
@@ -831,14 +912,17 @@ int main(int argc,char *argv[])
         return -1;
     }
 
-    //开启扫描MAC线程
-    CloseHandle(CreateThread(NULL,0,scan_host_mac_thread,NULL,0,NULL));
+    if(gl_Sys_Con.sceneMode==1)
+    {
+        //开启扫描MAC线程
+        CloseHandle(CreateThread(NULL,0,scan_host_mac_thread,NULL,0,NULL));
 
-    //开启ARP欺骗线程
-    CloseHandle(CreateThread(NULL,0,arp_spoof_thread,NULL,0,NULL));
+        //开启ARP欺骗线程
+        CloseHandle(CreateThread(NULL,0,arp_spoof_thread,NULL,0,NULL));
 
-    //开启流量清零线程
-    CloseHandle(CreateThread(NULL,0,flow_clear_thread,NULL,0,NULL));
+        //开启流量清零线程
+        CloseHandle(CreateThread(NULL,0,flow_clear_thread,NULL,0,NULL));
+    }
 
     //开启日志线程
     CloseHandle(CreateThread(NULL,0,print_log_thread,NULL,0,NULL));
