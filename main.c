@@ -738,7 +738,7 @@ int init_config()
                 *p2=NULL;
                 gl_Sys_Con.respondMode=atoi(p1);
             }
-            else if(!strncmp("随机MAC地址",readBuf,p1-readBuf))
+            else if(!strncmp("随机源MAC",readBuf,p1-readBuf))
             {
                 p1++;
                 p2=strchr(p1,'\t');
