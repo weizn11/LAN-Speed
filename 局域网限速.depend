@@ -10,3 +10,14 @@
 	<iphlpapi.h>
 	<time.h>
 
+1494342544 source:c:\users\weizinan\desktop\lan-speed-master\main.c
+	<stdio.h>
+	<stdlib.h>
+	<string.h>
+	<windows.h>
+	<pcap.h>
+	<conio.h>
+	<winsock2.h>
+	<iphlpapi.h>
+	<time.h>
+

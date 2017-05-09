@@ -18,7 +18,7 @@ const char *about_str=\
                       "\n"
                       "\t-------------------------------------------------------------\n"
                       "\t+                                                           +\n"
-                      "\t+                   局域网限速（Ver 2.1）                   +\n"
+                      "\t+                   局域网限速（Ver 2.3）                   +\n"
                       "\t+                                                           +\n"
                       "\t+                                                           +\n"
                       "\t+          赠给大学志同道合的基友 坤坤 AND 小张             +\n"
@@ -32,9 +32,9 @@ const char *config_format=\
                           "限速模式=1\t\t#1.白名单  2.黑名单\n"
                           "场景模式=1\t\t#1.正常    2.广播域隔离\n"
                           "应答模式=1\t\t#1.主动    2.被动\n"
-                          "随机源MAC=0\t\t#0.否      1.是（将造成局域网内其它主机断网）\n"
-                          "限制总速率=50\t\t#单位：Kb/s\n"
-                          "发包间隔=3000\t\t#单位：ms\n"
+                          "断网模式=0\t\t#0.否      1.是（随机源MAC地址）\n"
+                          "限制总速率=100\t\t#单位：Kb/s\n"
+                          "应答间隔=1000\t\t#单位：ms\n"
                           "混淆间隔=300\t\t#单位：s\n"
                           "[主机列表]\n";
 
@@ -43,7 +43,7 @@ typedef struct _System_Config_
     int confineMode;   //限速模式
     int sceneMode;     //场景模式
     int respondMode;   //应答模式
-    int interval;      //发包间隔
+    int interval;      //应答间隔
     int messInterval;  //全网扰乱间隔
     int randMAC;       //随机MAC
     int totalSpeed;    //总速率
@@ -738,7 +738,7 @@ int init_config()
                 *p2=NULL;
                 gl_Sys_Con.respondMode=atoi(p1);
             }
-            else if(!strncmp("随机源MAC",readBuf,p1-readBuf))
+            else if(!strncmp("断网模式",readBuf,p1-readBuf))
             {
                 p1++;
                 p2=strchr(p1,'\t');
@@ -746,7 +746,7 @@ int init_config()
                 *p2=NULL;
                 gl_Sys_Con.randMAC=atoi(p1);
             }
-            else if(!strncmp("发包间隔",readBuf,p1-readBuf))
+            else if(!strncmp("应答间隔",readBuf,p1-readBuf))
             {
                 p1++;
                 p2=strchr(p1,'\t');
@@ -1047,6 +1047,28 @@ DWORD WINAPI arp_spoof_thread(LPVOID para)
     return 0;
 }
 
+DWORD WINAPI arp_protect_thread(LPVOID para)
+{
+    char ARPPacket[60];
+    clock_t timestamp = 0;
+
+    while(1)
+    {
+        if(clock()-timestamp>gl_Sys_Con.interval)
+        {
+            memset(ARPPacket,NULL,sizeof(ARPPacket));
+
+            Fill_ARPPACKET(ARPPacket,sizeof(ARPPacket),gl_Sys_Con.gatewayMAC,gl_Sys_Con.gatewayIp,\
+                           gl_Sys_Con.myMAC,gl_Sys_Con.myIPAddress,2);
+            SendPacket(gl_Sys_Con.hpcap,ARPPacket,sizeof(ARPPacket));
+            arpPacketCount++;
+            timestamp=clock();
+        }
+    }
+
+    return 0;
+}
+
 DWORD WINAPI print_log_thread(LPVOID para)
 {
     int aliveCount,n,notResHost;
@@ -1086,7 +1108,7 @@ DWORD WINAPI print_log_thread(LPVOID para)
         printf("\t|\t限速主机:\t%d\t\t个\t\t    |\n",aliveCount);
         printf("\t|\t无应答主机：\t%d\t\t个\t\t    |\n",notResHost);
         printf("\t|\t探测计数：\t%d\t\t次\t\t    |\n",macScanCount);
-        printf("\t|\t发送ARP包:\t%d\t\t个\t\t    |\n",arpPacketCount);
+        printf("\t|\t应答ARP包:\t%d\t\t个\t\t    |\n",arpPacketCount);
         printf("\t|\t接收流量包:\t%d\t\t个\t\t    |\n",flowPacketCount);
         printf("\t|\t转发流量速率:\t%.2f\t\tKb/s\t\t    |\n",recordFlowSpeed/1024);
         printf("\t|\t总转发流量:\t%.2f\t\tMb\t\t    |\n",totalFlowSize/1024/1024);
@@ -1104,6 +1126,7 @@ int main(int argc,char *argv[])
     char myIPAddress[16],myMAC[6];
     char gatewayIp[16];
     pcap_t *hpcap=NULL;
+    HANDLE hThread = NULL;
 
     InitializeCriticalSection(&cs_flowSpeed);
     InitializeCriticalSection(&cs_arpCount);
@@ -1113,6 +1136,8 @@ int main(int argc,char *argv[])
     SMALL_RECT winPon= {0,0,80,30};
     HANDLE con=GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleWindowInfo(con,TRUE,&winPon);
+    CONSOLE_CURSOR_INFO cursor_info = {1, 0};
+    SetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), &cursor_info);
 
     about();
     if(init_config()!=0)
@@ -1157,19 +1182,52 @@ int main(int argc,char *argv[])
     }
 
     //开启扫描MAC线程
-    CloseHandle(CreateThread(NULL,0,scan_host_mac_thread,NULL,0,NULL));
+    hThread = CreateThread(NULL,0,scan_host_mac_thread,NULL,0,NULL);
+    if(hThread == NULL)
+    {
+        puts("Create scan_host_mac_thread failed.");
+        getch();
+        exit(-1);
+    }
 
     if(gl_Sys_Con.respondMode==1)
     {
         //开启ARP欺骗线程
-        CloseHandle(CreateThread(NULL,0,arp_spoof_thread,NULL,0,NULL));
+        hThread = CreateThread(NULL,0,arp_spoof_thread,NULL,0,NULL);
+        if(hThread == NULL)
+        {
+            puts("Create arp_spoof_thread failed.");
+            getch();
+            exit(-1);
+        }
+    }
+
+    //开启本机ARP防护线程
+    hThread = CreateThread(NULL, 0, arp_protect_thread, NULL, 0, NULL);
+    if(hThread == NULL)
+    {
+        puts("Create arp_protect_thread failed.");
+        getch();
+        exit(-1);
     }
 
     //开启流量清零线程
-    CloseHandle(CreateThread(NULL,0,flow_clear_thread,NULL,0,NULL));
+    hThread = CreateThread(NULL,0,flow_clear_thread,NULL,0,NULL);
+    if(hThread == NULL)
+    {
+        puts("Create flow_clear_thread failed.");
+        getch();
+        exit(-1);
+    }
 
     //开启日志线程
-    CloseHandle(CreateThread(NULL,0,print_log_thread,NULL,0,NULL));
+    hThread = CreateThread(NULL,0,print_log_thread,NULL,0,NULL);
+    if(hThread == NULL)
+    {
+        puts("Create print_log_thread failed.");
+        getch();
+        exit(-1);
+    }
 
     //进入嗅探转发
     sniffer();
