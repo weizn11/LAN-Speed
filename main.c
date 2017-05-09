@@ -921,9 +921,9 @@ DWORD WINAPI scan_host_mac_thread(LPVOID para)
         {
             if(pNode->alive)
             {
-                if(!memory_empty(pNode->mac,6) && time(NULL)-pNode->timestamp>60)
+                if(!memory_empty(pNode->mac,6) && time(NULL)-pNode->timestamp>60*5)
                 {
-                    //有应答主机条目超过60秒失效
+                    //有应答主机条目超过5分钟失效
                     memset(pNode->mac,NULL,6);
                     pNode->alive=0;
                 }
