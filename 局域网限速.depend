@@ -21,3 +21,14 @@
 	<iphlpapi.h>
 	<time.h>
 
+1494343321 source:d:\lan-speed\main.c
+	<stdio.h>
+	<stdlib.h>
+	<string.h>
+	<windows.h>
+	<pcap.h>
+	<conio.h>
+	<winsock2.h>
+	<iphlpapi.h>
+	<time.h>
+

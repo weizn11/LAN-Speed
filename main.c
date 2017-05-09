@@ -1042,6 +1042,8 @@ DWORD WINAPI arp_spoof_thread(LPVOID para)
             }
             timestamp_2=clock();
         }
+
+        Sleep(1);
     }
 
     return 0;
@@ -1064,6 +1066,7 @@ DWORD WINAPI arp_protect_thread(LPVOID para)
             arpPacketCount++;
             timestamp=clock();
         }
+        Sleep(1);
     }
 
     return 0;
